@@ -62,6 +62,7 @@ jobs:
           else
             echo "emSign not in system store"
             echo "| System store | OK | not present |" >> "$GITHUB_STEP_SUMMARY"
+            echo "SYSTEM_STORE_OK=1" >> "$GITHUB_ENV"
           fi
           dpkg -s ca-certificates 2>/dev/null | grep -i '^version' || true
 
@@ -79,6 +80,7 @@ jobs:
           else
             echo "emSign not in system keychains"
             echo "| System store | OK | not present |" >> "$GITHUB_STEP_SUMMARY"
+            echo "SYSTEM_STORE_OK=1" >> "$GITHUB_ENV"
           fi
 
       - name: System store (Windows)
@@ -162,7 +164,7 @@ jobs:
             echo "| Java | SKIP | keytool not found |" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          "$KT" -version 2>&1 | head -1
+          "$KT" -J-version 2>&1 | head -1
           out=$("$KT" -list -cacerts -storepass changeit 2>/dev/null | grep -iE 'emsign.*ecc.*g3')
           if [ -n "$out" ]; then
             echo "FOUND: $out"
@@ -184,6 +186,10 @@ jobs:
           pat=${pat:-0}; pat=${pat%%[!0-9]*}
           # Fixed in 1.27.3 and 1.26.10 (CVE-2026-111943)
           status=EXPOSED; detail="go$v lacks the fix (need >=1.27.3 or >=1.26.10)"
+          if [ "${SYSTEM_STORE_OK:-0}" = "1" ]; then
+            status=WARN
+            detail="go$v is older than the fixed releases (>=1.27.3 or >=1.26.10); system store is clean so not exploitable here, but pin a fixed Go"
+          fi
           if [ "$maj" -gt 1 ] || { [ "$maj" -eq 1 ] && [ "$min" -gt 27 ]; }; then
             status=OK; detail="go$v is newer than the fixed releases"
           elif [ "$maj" -eq 1 ] && [ "$min" -eq 27 ] && [ "$pat" -ge 3 ]; then
