@@ -234,6 +234,50 @@ jobs:
             fi
           fi
 
+      # ---------- Live endpoints presenting certs from the compromised intermediates ----------
+      # A successful TLS handshake means the client TRUSTS the bad chain (EXPOSED).
+      # A certificate verification error is the GOOD outcome (OK).
+      # DNS/timeouts are reported as UNKNOWN and do not count as OK.
+
+      - name: Live test endpoints
+        run: |
+          set +e
+          HOSTS="${HOSTS:-dv-g3b-emudhra.we-have-a-problem.com dv-g3b-aaa-emudhra.we-have-a-problem.com}"
+          for host in $HOSTS; do
+            # curl: 0 = trusted (bad), 60/35 = verification rejected (good)
+            curl -sS -m 20 -o /dev/null "https://$host/" 2>/dev/null
+            rc=$?
+            case $rc in
+              0)     st=EXPOSED;  d="handshake succeeded, chain is trusted" ;;
+              60|35) st=OK;       d="certificate rejected (curl exit $rc)" ;;
+              *)     st=UNKNOWN;  d="inconclusive (curl exit $rc)" ;;
+            esac
+            echo "curl  $host -> $st ($d)"
+            echo "| curl: $host | $st | $d |" >> "$GITHUB_STEP_SUMMARY"
+            [ "$st" = EXPOSED ] && echo "EXPOSED=1" >> "$GITHUB_ENV"
+
+            if command -v node >/dev/null; then
+              node -e '
+                fetch("https://" + process.argv[1] + "/").then(
+                  () => process.exit(0),
+                  e => {
+                    const c = (e.cause && e.cause.code) || "";
+                    console.error(c);
+                    process.exit(/CERT|UNABLE_TO_VERIFY|SELF_SIGNED|DEPTH_ZERO|ISSUER/.test(c) ? 10 : 11);
+                  });
+              ' "$host" 2>/dev/null
+              rc=$?
+              case $rc in
+                0)  st=EXPOSED; d="handshake succeeded, chain is trusted" ;;
+                10) st=OK;      d="certificate rejected" ;;
+                *)  st=UNKNOWN; d="inconclusive (exit $rc)" ;;
+              esac
+              echo "node  $host -> $st ($d)"
+              echo "| node: $host | $st | $d |" >> "$GITHUB_STEP_SUMMARY"
+              [ "$st" = EXPOSED ] && echo "EXPOSED=1" >> "$GITHUB_ENV"
+            fi
+          done
+
       # ---------- Verdict ----------
 
       - name: Verdict
