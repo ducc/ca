@@ -1,0 +1,249 @@
+name: emudhra-trust-check
+
+# Audits GitHub-hosted runners for the distrusted eMudhra root
+# (emSign ECC Root CA - G3). Uses no third-party actions.
+# Drop into .github/workflows/ and run via "Run workflow".
+
+on:
+  workflow_dispatch:
+    inputs:
+      certifi_version:
+        description: "certifi version to test (blank = latest from pip)"
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  audit:
+    name: audit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Runner info
+        run: |
+          {
+            echo "## Trust audit: ${{ matrix.os }}"
+            echo ""
+            echo "Looking for: emSign ECC Root CA - G3 (eMudhra) in each trust store"
+            echo ""
+            echo "| Check | Result | Detail |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          uname -a || true
+          echo "ImageOS=${ImageOS:-n/a} ImageVersion=${ImageVersion:-n/a}"
+
+      # ---------- System trust stores ----------
+
+      - name: System store (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set +e
+          d=$(mktemp -d)
+          awk -v d="$d" '/BEGIN CERTIFICATE/{n++} {print > (d "/c" n ".pem")}' /etc/ssl/certs/ca-certificates.crt
+          hits=""
+          for f in "$d"/c*.pem; do
+            s=$(openssl x509 -in "$f" -noout -subject 2>/dev/null)
+            echo "$s" | grep -qiE 'emsign.*ecc.*g3' && hits="$hits; $s"
+          done
+          if [ -n "$hits" ]; then
+            echo "FOUND:$hits"
+            echo "| System store | EXPOSED | present${hits} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "EXPOSED=1" >> "$GITHUB_ENV"
+          else
+            echo "emSign not in system store"
+            echo "| System store | OK | not present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          dpkg -s ca-certificates 2>/dev/null | grep -i '^version' || true
+
+      - name: System store (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set +e
+          out=$(security find-certificate -a -c "emSign ECC Root CA - G3" \
+            /System/Library/Keychains/SystemRootCertificates.keychain \
+            /Library/Keychains/System.keychain 2>/dev/null | grep -i '"alis"')
+          if [ -n "$out" ]; then
+            echo "FOUND: $out"
+            echo "| System store | EXPOSED | present |" >> "$GITHUB_STEP_SUMMARY"
+            echo "EXPOSED=1" >> "$GITHUB_ENV"
+          else
+            echo "emSign not in system keychains"
+            echo "| System store | OK | not present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: System store (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set +e
+          powershell.exe -NoProfile -Command '$h = Get-ChildItem Cert:\LocalMachine\Root,Cert:\LocalMachine\AuthRoot -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match "emSign ECC Root CA - G3" }; if ($h) { $h | ForEach-Object { $_.Subject }; exit 1 } else { exit 0 }'
+          if [ $? -ne 0 ]; then
+            echo "| System store | EXPOSED | present |" >> "$GITHUB_STEP_SUMMARY"
+            echo "EXPOSED=1" >> "$GITHUB_ENV"
+          else
+            echo "| System store | OK | not present (Windows may fetch roots on demand) |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ---------- Language runtimes with their own bundles ----------
+
+      - name: Node.js bundled roots
+        run: |
+          set +e
+          if ! command -v node >/dev/null; then
+            echo "| Node | SKIP | node not installed |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node --version
+          out=$(node -e '
+            const tls = require("tls");
+            const { X509Certificate } = require("crypto");
+            const hits = tls.rootCertificates
+              .map(p => new X509Certificate(p).subject.replace(/\n/g, ", "))
+              .filter(s => /emsign.*ecc.*g3/i.test(s));
+            if (hits.length) { console.log(hits.join(" | ")); process.exit(1); }
+          ')
+          if [ $? -ne 0 ]; then
+            echo "FOUND: $out"
+            echo "| Node $(node --version) | EXPOSED | bundled roots include emSign |" >> "$GITHUB_STEP_SUMMARY"
+            echo "EXPOSED=1" >> "$GITHUB_ENV"
+          else
+            echo "| Node $(node --version) | OK | not in bundled roots |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Python certifi
+        env:
+          CERTIFI_VERSION: ${{ inputs.certifi_version }}
+        run: |
+          set +e
+          PYBIN=$(command -v python3 || command -v python)
+          if [ -z "$PYBIN" ]; then
+            echo "| Python certifi | SKIP | python not installed |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          V="$RUNNER_TEMP/venv"
+          "$PYBIN" -m venv "$V"
+          PY="$V/bin/python"; [ -x "$PY" ] || PY="$V/Scripts/python.exe"
+          if [ -n "$CERTIFI_VERSION" ]; then
+            "$PY" -m pip install --quiet "certifi==$CERTIFI_VERSION"
+          else
+            "$PY" -m pip install --quiet --upgrade certifi
+          fi
+          ver=$("$PY" -c 'import certifi; print(certifi.__version__)')
+          out=$("$PY" -c '
+          import ssl, certifi, sys
+          ctx = ssl.create_default_context(cafile=certifi.where())
+          hits = [str(c["subject"]) for c in ctx.get_ca_certs() if "emsign ecc root ca - g3" in str(c["subject"]).lower()]
+          print(" | ".join(hits))
+          sys.exit(1 if hits else 0)
+          ')
+          if [ $? -ne 0 ]; then
+            echo "FOUND: $out"
+            echo "| certifi $ver | EXPOSED | bundle includes emSign |" >> "$GITHUB_STEP_SUMMARY"
+            echo "EXPOSED=1" >> "$GITHUB_ENV"
+          else
+            echo "| certifi $ver | OK | not in bundle |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Java cacerts
+        run: |
+          set +e
+          KT="${JAVA_HOME:-}/bin/keytool"
+          [ -x "$KT" ] || KT=$(command -v keytool)
+          if [ -z "$KT" ]; then
+            echo "| Java | SKIP | keytool not found |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          "$KT" -version 2>&1 | head -1
+          out=$("$KT" -list -cacerts -storepass changeit 2>/dev/null | grep -iE 'emsign.*ecc.*g3')
+          if [ -n "$out" ]; then
+            echo "FOUND: $out"
+            echo "| Java cacerts | EXPOSED | keystore includes emSign |" >> "$GITHUB_STEP_SUMMARY"
+            echo "EXPOSED=1" >> "$GITHUB_ENV"
+          else
+            echo "| Java cacerts | OK | not present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Go version and system pool
+        run: |
+          set +e
+          if ! command -v go >/dev/null; then
+            echo "| Go | SKIP | go not installed |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          v=$(go env GOVERSION | sed 's/^go//')
+          IFS=. read -r maj min pat <<< "$v"
+          pat=${pat:-0}; pat=${pat%%[!0-9]*}
+          # Fixed in 1.27.3 and 1.26.10 (CVE-2026-111943)
+          status=EXPOSED; detail="go$v lacks the fix (need >=1.27.3 or >=1.26.10)"
+          if [ "$maj" -gt 1 ] || { [ "$maj" -eq 1 ] && [ "$min" -gt 27 ]; }; then
+            status=OK; detail="go$v is newer than the fixed releases"
+          elif [ "$maj" -eq 1 ] && [ "$min" -eq 27 ] && [ "$pat" -ge 3 ]; then
+            status=OK; detail="go$v includes the fix"
+          elif [ "$maj" -eq 1 ] && [ "$min" -eq 26 ] && [ "$pat" -ge 10 ]; then
+            status=OK; detail="go$v includes the fix"
+          fi
+          echo "$detail"
+          echo "| Go toolchain | $status | $detail |" >> "$GITHUB_STEP_SUMMARY"
+          [ "$status" = EXPOSED ] && echo "EXPOSED=1" >> "$GITHUB_ENV"
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            d=$(mktemp -d); cd "$d"
+            cat > main.go <<'EOF'
+          package main
+
+          import (
+          	"crypto/x509"
+          	"fmt"
+          	"os"
+          	"strings"
+          )
+
+          func main() {
+          	pool, err := x509.SystemCertPool()
+          	if err != nil {
+          		fmt.Println("pool error:", err)
+          		os.Exit(2)
+          	}
+          	n := 0
+          	for _, s := range pool.Subjects() { //nolint:staticcheck
+          		if strings.Contains(strings.ToLower(string(s)), "emsign ecc root ca - g3") {
+          			n++
+          		}
+          	}
+          	fmt.Println("emSign roots in Go system pool:", n)
+          	if n > 0 {
+          		os.Exit(1)
+          	}
+          }
+          EOF
+            go run main.go
+            if [ $? -eq 1 ]; then
+              echo "| Go system pool | EXPOSED | emSign present |" >> "$GITHUB_STEP_SUMMARY"
+              echo "EXPOSED=1" >> "$GITHUB_ENV"
+            else
+              echo "| Go system pool | OK | not present |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+      # ---------- Verdict ----------
+
+      - name: Verdict
+        run: |
+          if [ "${EXPOSED:-0}" = "1" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Result: EXPOSED. At least one trust store or toolchain still trusts or lacks the fix.**" >> "$GITHUB_STEP_SUMMARY"
+            echo "EXPOSED: see the summary table"
+            exit 1
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Result: no exposure found in the checked stores.**" >> "$GITHUB_STEP_SUMMARY"
+          echo "OK"
